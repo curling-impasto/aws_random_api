@@ -78,27 +78,20 @@ Assumed by the running container.
 
 ## CloudFormation Stack Dependency Order
 
-\```
-root.yaml  (random-api-root-dev)
-│
-├── IAMStack   [iam.yaml]  ──────────┐
-│   ECSExecutionRole                 │  both complete before ECSStack starts
-│   ECSTaskRole                      │  (CF infers via !GetAtt references)
-│                                    │
-├── ALBStack   [alb.yaml]  ──────────┤
-│   RandomTargetGroup                │
-│   RandomListenerRule (/random*)    │
-│                                    ▼
-├── ECSStack   [ecs.yaml]  ───────────────────────┐
-│   RandomApiLogGroup                             │  complete before CWStack
-│   RandomApiTaskDefinition                       │
-│   RandomApiService                              │
-│                                                 ▼
-└── CWStack    [cw.yaml]
-    ErrorAlarmTopic  (SNS)
-    ErrorMetricFilter
-    ErrorAlarm
-\```
+```mermaid
+flowchart TD
+    Root["root.yaml\nrandom-api-root-dev"]
+    IAM["IAMStack — iam.yaml\nECSExecutionRole\nECSTaskRole"]
+    ALB["ALBStack — alb.yaml\nRandomTargetGroup\nRandomListenerRule"]
+    ECS["ECSStack — ecs.yaml\nRandomApiLogGroup\nRandomApiTaskDefinition\nRandomApiService"]
+    CW["CWStack — cw.yaml\nErrorAlarmTopic\nErrorMetricFilter\nErrorAlarm"]
+
+    Root --> IAM
+    Root --> ALB
+    IAM --> ECS
+    ALB --> ECS
+    ECS --> CW
+```
 
 ---
 
