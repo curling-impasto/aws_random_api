@@ -6,82 +6,38 @@
 
 ## Architecture Overview
 
-\```
-Inside VPC
-    │
-    │  HTTPS :443
-    ▼
-┌─────────────────────────────────────────────────────┐
-│  Application Load Balancer  (pre-existing)          │
-│  Listener: HTTPS :443                               │
-│  ┌───────────────────────────────────────────────┐  │
-│  │  ListenerRule                                 │  │
-│  │  path-pattern: /random*  →  forward           │  │
-│  │  priority: 100                                │  │
-│  └───────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────┘
-    │  HTTP :8080  (path /random*)
-    ▼
-┌─────────────────────────────────────────────────────┐
-│  Target Group: random-api-dev-tg                    │
-│  type: ip  |  protocol: HTTP  |  port: 8080         │
-│  health-check: GET /random  →  expect HTTP 200      │
-└─────────────────────────────────────────────────────┘
-    │  registers task ENI IPs
-    ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  ECS Cluster  (pre-existing)                                    │
-│  Service: random-api-dev                                        │
-│  LaunchType: FARGATE  |  DesiredCount: 1  |  PublicIp: DISABLED │
-│                                                                 │
-│  Task Definition: random-api-dev                                │
-│  CPU: 256 (0.25 vCPU)  |  Memory: 512 MB  |  Network: awsvpc   │
-│                                                                 │
-│  Container: random-api                                          │
-│  Image: cx-devops-ecs:random-api  (pre-built in ECR)            │
-│  Port: 8080                                                     │
-│                                                                 │
-│  GET /random                                                    │
-│  ┌────────────────────────────────────────────────────┐         │
-│  │  random.random() >= 0.2  (~80%)                   │         │
-│  │  → HTTP 200  {"status":"success",                 │         │
-│  │               "message":"Hello from random!",     │         │
-│  │               "request_id":"<uuid>"}              │         │
-│  ├────────────────────────────────────────────────────┤         │
-│  │  random.random() < 0.2   (~20%)                   │         │
-│  │  → HTTP 500  {"status":"error",                   │         │
-│  │               "message":"Something went wrong.",  │         │
-│  │               "request_id":"<uuid>"}              │         │
-│  └────────────────────────────────────────────────────┘         │
-│  Subnets: private-subnet-a, private-subnet-b                    │
-│  SecGroup: <pre-existing SG>                                    │
-└─────────────────────────────────────────────────────────────────┘
-    │  awslogs driver (stdout → CloudWatch)
-    ▼
-┌──────────────────────────────────────────────────────────────┐
-│  CloudWatch Logs                                             │
-│  Log Group: /ecs/random-api-dev  |  Retention: 14 days      │
-│  Log Stream prefix: random-api                               │
-│                                                              │
-│  INFO   {"status":"success","message":"...","request_id":"…"}│
-│  ERROR  {"status":"error","message":"...","request_id":"…"}  │
-└──────────────────────────────────────────────────────────────┘
-    │  MetricFilter: { $.status = "error" }
-    │  Namespace: random-api/dev  |  MetricName: ErrorCount
-    ▼
-┌──────────────────────────────────────────────────────────────┐
-│  CloudWatch Alarm: random-api-dev-error-rate                 │
-│  ErrorCount >= 1  in  1 × 60s period                        │
-│  TreatMissingData: notBreaching                              │
-└──────────────────────────────────────────────────────────────┘
-    │  ALARM / OK state change
-    ▼
-┌──────────────────────────────────────────────────────────────┐
-│  SNS Topic: random-api-dev-error-alarm                       │
-│  Subscription: email → <ALARM_EMAIL>                         │
-│  (manual confirmation required)                              │
-└──────────────────────────────────────────────────────────────┘
-\```
+## Architecture
+
+```mermaid
+flowchart TD
+    Internet["🌐 HTTPS :443"]
+    ALB["Application Load Balancer\n(pre-existing)\nHTTPS Listener :443"]
+    Rule["Listener Rule\npath: /random* → forward\npriority: 100"]
+    TG["Target Group: random-api-dev-tg\ntype: ip | HTTP :8080\nhealth-check: GET /random → 200"]
+    ECS["ECS Cluster (pre-existing)"]
+    SVC["Service: random-api-dev\nFargate | DesiredCount: 1 | PublicIp: DISABLED"]
+    TD["Task Definition: random-api-dev\n0.25 vCPU | 512 MB | awsvpc"]
+    Container["Container: random-api\nImage: cx-devops-ecs:random-api\nPort: 8080"]
+    Success["HTTP 200 (~80%)\n{status: success}"]
+    Error["HTTP 500 (~20%)\n{status: error}"]
+    CWLogs["CloudWatch Logs\nLog Group: /ecs/random-api-dev\nRetention: 14 days"]
+    MetricFilter["Metric Filter\n{ $.status = 'error' }\n→ ErrorCount +1"]
+    Alarm["CloudWatch Alarm\nrandom-api-dev-error-rate\nErrorCount ≥ 1 per 60s"]
+    SNS["SNS Topic\nrandom-api-dev-error-alarm\nEmail → ALARM_EMAIL"]
+
+    Internet --> ALB
+    ALB --> Rule
+    Rule --> TG
+    TG --> SVC
+    SVC --> TD
+    TD --> Container
+    Container --> Success
+    Container --> Error
+    Container -->|stdout JSON| CWLogs
+    CWLogs --> MetricFilter
+    MetricFilter --> Alarm
+    Alarm -->|ALARM/OK| SNS
+```
 
 ---
 
@@ -156,7 +112,7 @@ Triggered on push to `main`.
 |---|---|
 | 1 | Checkout |
 | 2 | Validate CF templates (`cfn validate` — PR + push) |
-| 3 | `aws s3 sync random-api/infra/ → s3://ctx-devops-cfn-dev/random-api/` |
+| 3 | `aws s3 sync random-api/infra/ → s3://devops-cfn-dev/random-api/` |
 | 4 | Preflight: delete stack if `ROLLBACK_COMPLETE` |
 | 5 | `aws cloudformation deploy` (root.yaml, `CAPABILITY_NAMED_IAM`) — `ImageUri` from `vars.ECR_IMAGE_URI` |
 | 6 | Show stack outputs |
@@ -190,21 +146,6 @@ Triggered on push to `main`.
 | Security group |
 | Application Load Balancer |
 | HTTPS Listener (port 443) |
-| S3 bucket (`ctx-devops-cfn-dev`) |
-| ECR repository (`cx-devops-ecs`) + image tag (`random-api`) |
+| S3 bucket (`devops-cfn-dev`) |
+| ECR repository (`devops-ecs`) + image tag (`random-api`) |
 | CodeBuild GitHub runner |
-
-### Created by CloudFormation
-
-| Resource | Name |
-|---|---|
-| IAM ECSExecutionRole | `random-api-dev-ecs-execution-role` |
-| IAM ECSTaskRole | `random-api-dev-ecs-task-role` |
-| ALB Target Group | `random-api-dev-tg` (ip-mode, port 8080) |
-| ALB Listener Rule | path `/random*`, priority 100 |
-| CloudWatch Log Group | `/ecs/random-api-dev` (14-day retention) |
-| ECS Task Definition | `random-api-dev` (0.25 vCPU / 512 MB) |
-| ECS Service | `random-api-dev` (Fargate, DesiredCount 1) |
-| CloudWatch Metric Filter | `ErrorCount` — `{ $.status = "error" }` |
-| CloudWatch Alarm | `random-api-dev-error-rate` (fires at ≥ 1 error/min) |
-| SNS Topic | `random-api-dev-error-alarm` (email subscription) |
