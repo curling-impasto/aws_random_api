@@ -1,0 +1,265 @@
+# =============================================================================
+# random-api — root.yaml  (Nested Stack Root)
+#
+# Single entry point. Deploys four child stacks in dependency order:
+#
+#   iam.yaml ─┐
+#              ├──► ecs.yaml ──► cw.yaml
+#   alb.yaml ─┘
+#
+# IAM and ALB deploy in parallel (no dependency between them).
+# ECS waits for both IAM (needs role ARNs) and ALB (needs target group ARN).
+# CW waits for ECS (needs log group name).
+#
+# CloudFormation infers all ordering from the !GetAtt dependency chain —
+# no explicit DependsOn is required on any nested stack resource.
+#
+# Image:
+#   The container image is pre-built and stored in ECR.
+#   Repository: cx-devops-ecs   Image name: random-api
+#   Full URI is supplied at deploy time via the ECR_IMAGE_URI repo variable.
+#   No Docker build or push steps are performed by the GH Action.
+#
+# GH Action deploy command:
+#
+#   aws cloudformation deploy \
+#     --stack-name random-api-root-dev \
+#     --template-file random-api/infra/root.yaml \
+#     --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+#     --parameter-overrides \
+#       ImageUri=${{ env.ECR_IMAGE_URI }} \        ← hardcoded in build.yml env block
+#       ClusterArn=${{ vars.ECS_CLUSTER_ARN }} \   ← GitHub repo variable
+#       SecurityGroupId=${{ vars.ECS_SECURITY_GROUP_ID }} \
+#       SubnetIds=${{ vars.PRIVATE_SUBNET_IDS }} \
+#       VpcId=${{ vars.VPC_ID }} \
+#       ListenerArn=${{ vars.ALB_LISTENER_ARN }} \
+#       AlarmEmail=${{ env.ALARM_EMAIL }}           ← hardcoded in build.yml env block
+#
+# Before deploying, sync templates to S3:
+#   aws s3 sync random-api/infra/ s3://<TemplateBucket>/random-api/
+# =============================================================================
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  random-api — Root nested stack.
+  Deploys IAM + ALB in parallel, then ECS, then CloudWatch.
+  Container image is pre-built in ECR (cx-devops-ecs/random-api).
+
+# -----------------------------------------------------------------------------
+# Parameters
+# -----------------------------------------------------------------------------
+Parameters:
+  ProjectName:
+    Type: String
+    Default: random-api
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, ppe, prod]
+
+  TemplateBucket:
+    Type: String
+    Description: >
+      Shared S3 bucket that holds the uploaded CloudFormation templates.
+      Example: ctx-devops-cfn-dev
+
+  TemplateBucketPrefix:
+    Type: String
+    Default: random-api
+    Description: Per-project folder inside the shared bucket.
+
+  ImageUri:
+    Type: String
+    Description: >
+      Full ECR image URI for the pre-built random-api container.
+      Image lives in the cx-devops-ecs repository and is built manually.
+      Example: 123456789012.dkr.ecr.us-east-1.amazonaws.com/cx-devops-ecs:random-api
+      Supplied at deploy time via the ECR_IMAGE_URI GitHub repo variable.
+
+  ClusterArn:
+    Type: String
+    Description: >
+      ARN or name of the pre-existing ECS cluster where the service will run.
+      Example: arn:aws:ecs:us-east-1:123456789012:cluster/my-cluster
+               OR just: my-cluster
+
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: >
+      Pre-existing security group for Fargate task ENIs.
+      Must allow inbound TCP 8080 from the ALB security group.
+
+  SubnetIds:
+    Type: CommaDelimitedList
+    Description: >
+      Comma-delimited list of private subnet IDs for Fargate tasks.
+      Example: subnet-aaa111bb,subnet-ccc222dd
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: >
+      ID of the pre-existing VPC (passed to alb.yaml for target group creation).
+
+  ListenerArn:
+    Type: String
+    Description: >
+      ARN of the pre-existing HTTPS ALB listener (port 443).
+      The listener rule in alb.yaml will be attached to this listener.
+
+  AlarmEmail:
+    Type: String
+    Description: >
+      Email address for CloudWatch alarm notifications via SNS.
+      AWS sends a subscription confirmation email after first deploy.
+
+# -----------------------------------------------------------------------------
+# Resources
+# -----------------------------------------------------------------------------
+Resources:
+  # ── 1. IAM ─────────────────────────────────────────────────────────────────
+  # No upstream dependencies — deploys first (in parallel with ALBStack).
+  # Creates ECSExecutionRole and ECSTaskRole used by ECSStack.
+  IAMStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${TemplateBucket}.s3.${AWS::URLSuffix}/${TemplateBucketPrefix}/iam.yaml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ── 2. ALB ─────────────────────────────────────────────────────────────────
+  # No upstream dependencies — deploys in parallel with IAMStack.
+  # Creates RandomTargetGroup (ip-mode) and RandomListenerRule (/random*).
+  # CF infers ECSStack depends on this via the !GetAtt TargetGroupArn below,
+  # guaranteeing ALBStack is COMPLETE before ECSStack starts.
+  ALBStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${TemplateBucket}.s3.${AWS::URLSuffix}/${TemplateBucketPrefix}/alb.yaml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        VpcId: !Ref VpcId
+        ListenerArn: !Ref ListenerArn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ── 3. ECS ─────────────────────────────────────────────────────────────────
+  # Depends on IAMStack (role ARNs) and ALBStack (target group ARN).
+  # CF infers both dependencies from the !GetAtt references below.
+  # Creates RandomApiLogGroup, RandomApiTaskDefinition, RandomApiService.
+  ECSStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${TemplateBucket}.s3.${AWS::URLSuffix}/${TemplateBucketPrefix}/ecs.yaml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        ImageUri: !Ref ImageUri
+        ClusterArn: !Ref ClusterArn
+        SecurityGroupId: !Ref SecurityGroupId
+        SubnetIds: !Join [",", !Ref SubnetIds]
+        ExecutionRoleArn: !GetAtt IAMStack.Outputs.ExecutionRoleArn
+        TaskRoleArn: !GetAtt IAMStack.Outputs.TaskRoleArn
+        TargetGroupArn: !GetAtt ALBStack.Outputs.TargetGroupArn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ── 4. CloudWatch ──────────────────────────────────────────────────────────
+  # Depends on ECSStack (needs LogGroupName).
+  # CF infers the dependency from the !GetAtt reference below.
+  # Creates ErrorAlarmTopic, ErrorMetricFilter, ErrorAlarm.
+  CWStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${TemplateBucket}.s3.${AWS::URLSuffix}/${TemplateBucketPrefix}/cw.yaml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        LogGroupName: !GetAtt ECSStack.Outputs.LogGroupName
+        AlarmEmail: !Ref AlarmEmail
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# -----------------------------------------------------------------------------
+# Outputs — forward all child stack outputs to the root stack
+# -----------------------------------------------------------------------------
+Outputs:
+  # ── IAM ────────────────────────────────────────────────────────────────────
+  ExecutionRoleArn:
+    Description: ARN of the ECS execution role.
+    Value: !GetAtt IAMStack.Outputs.ExecutionRoleArn
+
+  ExecutionRoleName:
+    Description: Name of the ECS execution role.
+    Value: !GetAtt IAMStack.Outputs.ExecutionRoleName
+
+  TaskRoleArn:
+    Description: ARN of the ECS task role.
+    Value: !GetAtt IAMStack.Outputs.TaskRoleArn
+
+  TaskRoleName:
+    Description: Name of the ECS task role.
+    Value: !GetAtt IAMStack.Outputs.TaskRoleName
+
+  # ── ALB ────────────────────────────────────────────────────────────────────
+  TargetGroupArn:
+    Description: ARN of the ALB target group (ip-mode, port 8080).
+    Value: !GetAtt ALBStack.Outputs.TargetGroupArn
+
+  ListenerRuleArn:
+    Description: ARN of the ALB listener rule for /random*.
+    Value: !GetAtt ALBStack.Outputs.ListenerRuleArn
+
+  # ── ECS ────────────────────────────────────────────────────────────────────
+  LogGroupName:
+    Description: CloudWatch log group name for the random-api container.
+    Value: !GetAtt ECSStack.Outputs.LogGroupName
+
+  TaskDefinitionArn:
+    Description: ARN of the ECS task definition.
+    Value: !GetAtt ECSStack.Outputs.TaskDefinitionArn
+
+  ServiceName:
+    Description: Name of the ECS service.
+    Value: !GetAtt ECSStack.Outputs.ServiceName
+
+  ClusterArn:
+    Description: ARN/name of the ECS cluster (passed through for reference).
+    Value: !GetAtt ECSStack.Outputs.ClusterArn
+
+  # ── CloudWatch ─────────────────────────────────────────────────────────────
+  AlarmName:
+    Description: Name of the CloudWatch error rate alarm.
+    Value: !GetAtt CWStack.Outputs.AlarmName
+
+  TopicArn:
+    Description: ARN of the SNS error alarm topic.
+    Value: !GetAtt CWStack.Outputs.TopicArn
+
+  MetricFilterName:
+    Description: Name of the CloudWatch metric filter.
+    Value: !GetAtt CWStack.Outputs.MetricFilterName

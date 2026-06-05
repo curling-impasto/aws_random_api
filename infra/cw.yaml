@@ -1,0 +1,128 @@
+# =============================================================================
+# random-api — cw.yaml
+#
+# Creates the observability layer for the random-api service:
+#   ErrorAlarmTopic    — SNS topic; email subscription for alert delivery
+#   ErrorMetricFilter  — parses structured JSON logs for { $.status = "error" }
+#                        and emits an ErrorCount metric to random-api/${Environment}
+#   ErrorAlarm         — CW Alarm; fires when ErrorCount >= 1 in a 60 s window
+#
+# The log group is created by ecs.yaml and passed in as a parameter so this
+# stack has no hard dependency on ecs.yaml's internal resource names.
+#
+# Deploy order: iam.yaml ──► alb.yaml ──► ecs.yaml ──► cw.yaml
+# =============================================================================
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Random-API — CloudWatch metric filter, alarm, and SNS topic for error alerting.
+
+# -----------------------------------------------------------------------------
+# Parameters
+# -----------------------------------------------------------------------------
+Parameters:
+  ProjectName:
+    Type: String
+    Default: random-api
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, ppe, prod]
+
+  LogGroupName:
+    Type: String
+    Description: >
+      Name of the CloudWatch log group to attach the metric filter to.
+      Imported from ecs.yaml output via root.yaml (ECSStack.Outputs.LogGroupName).
+
+  AlarmEmail:
+    Type: String
+    Description: >
+      Email address for SNS alarm notifications.
+      AWS will send a confirmation email before alerts are delivered.
+
+# -----------------------------------------------------------------------------
+# Resources
+# -----------------------------------------------------------------------------
+Resources:
+  # ── 1. SNS Topic ───────────────────────────────────────────────────────────
+  # Delivers alarm state-change notifications to the on-call email.
+  # The email subscription requires manual confirmation after first deploy.
+  ErrorAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-${Environment}-error-alarm"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlarmEmail
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ── 2. Metric Filter ───────────────────────────────────────────────────────
+  # Scans every structured JSON log event for { $.status = "error" }.
+  # Matches the error payloads emitted by app.py when the 20% error path fires.
+  # Each matching event increments ErrorCount by 1; non-matching periods
+  # emit DefaultValue 0 so the alarm has a continuous data stream.
+  ErrorMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref LogGroupName
+      FilterPattern: '{ $.status = "error" }'
+      MetricTransformations:
+        - MetricNamespace: !Sub "${ProjectName}/${Environment}"
+          MetricName: ErrorCount
+          MetricValue: "1"
+          DefaultValue: 0
+
+  # ── 3. CloudWatch Alarm ────────────────────────────────────────────────────
+  # Single-period alarm — fires when more than 5 errors are detected in a
+  # 60 s window. A threshold of 5 avoids alerting on the occasional random
+  # 20% error while still catching sustained error bursts.
+  # TreatMissingData: notBreaching prevents false alarms during idle periods
+  # (e.g. overnight when no requests are made and no logs are emitted).
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-error-rate"
+      AlarmDescription: >
+        Fires when the random-api service returns errors (status=error in CW Logs).
+      Namespace: !Sub "${ProjectName}/${Environment}"
+      MetricName: ErrorCount
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref ErrorAlarmTopic
+      OKActions:
+        - !Ref ErrorAlarmTopic
+
+# -----------------------------------------------------------------------------
+# Outputs
+# -----------------------------------------------------------------------------
+Outputs:
+  AlarmName:
+    Description: Name of the CloudWatch error alarm.
+    Value: !Ref ErrorAlarm
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-alarm-name"
+
+  TopicArn:
+    Description: ARN of the SNS error alarm topic.
+    Value: !Ref ErrorAlarmTopic
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-topic-arn"
+
+  MetricFilterName:
+    Description: Name of the CloudWatch metric filter.
+    Value: !Ref ErrorMetricFilter
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-metric-filter-name"

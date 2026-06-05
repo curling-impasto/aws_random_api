@@ -1,0 +1,146 @@
+# =============================================================================
+# random-api — iam.yaml
+#
+# Creates two roles:
+#   ECSExecutionRole — used by the ECS agent to pull images and write logs
+#   ECSTaskRole      — used by the running container (CloudWatch Logs access)
+#
+# Permissions:
+#   ECSExecutionRole:
+#     - AmazonECSTaskExecutionRolePolicy (managed) — ECR pull + CW Logs
+#   ECSTaskRole:
+#     - CloudWatchLogsAccess (inline) — logs:CreateLogStream + logs:PutLogEvents
+#       scoped to /ecs/random-api-${Environment}:*
+#
+# Deploy order: iam.yaml ──► alb.yaml ──► ecs.yaml ──► cw.yaml
+# =============================================================================
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Random API — ECS execution role and task role with least-privilege access.
+
+# -----------------------------------------------------------------------------
+# Parameters
+# -----------------------------------------------------------------------------
+Parameters:
+  ProjectName:
+    Type: String
+    Default: random-api
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, ppe, prod]
+
+# -----------------------------------------------------------------------------
+# Resources
+# -----------------------------------------------------------------------------
+Resources:
+  # ── 1. ECS Execution Role ──────────────────────────────────────────────────
+  # Assumed by the ECS agent (not the container) to pull the image from ECR
+  # and create/write the CloudWatch log stream before the task starts.
+  ECSExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-ecs-execution-role"
+      Description: >
+        ECS task execution role - grants the ECS agent permission to pull
+        container images from ECR and publish logs to CloudWatch.
+
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowECSTasksAssume
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+
+      # AWS-managed policy covering ECR pull + CW Logs for ECS execution.
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ── 2. ECS Task Role ───────────────────────────────────────────────────────
+  # Assumed by the running container itself (not the ECS agent).
+  # Scoped only to the log group this service writes to.
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-ecs-task-role"
+      Description: >
+        ECS task role - grants the container permission to write structured
+        log events to the /ecs/random-api-${Environment} CloudWatch log group.
+
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowECSTasksAssume
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+
+      Policies:
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Allow the container to create the log group itself in case it
+              # does not yet exist. Scoped to the specific log group name.
+              - Sid: AllowLogGroupCreate
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                Resource: !Sub "arn:aws:logs:*:*:log-group:/ecs/random-api-${Environment}"
+              # Least-privilege: only the log group created by ecs.yaml,
+              # only the actions the application actually needs.
+              - Sid: AllowLogWrites
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:*:*:log-group:/ecs/random-api-${Environment}:log-stream:*"
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# -----------------------------------------------------------------------------
+# Outputs
+# -----------------------------------------------------------------------------
+Outputs:
+  ExecutionRoleArn:
+    Description: ARN of the ECS execution role.
+    Value: !GetAtt ECSExecutionRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-execution-role-arn"
+
+  ExecutionRoleName:
+    Description: Name of the ECS execution role.
+    Value: !Ref ECSExecutionRole
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-execution-role-name"
+
+  TaskRoleArn:
+    Description: ARN of the ECS task role.
+    Value: !GetAtt ECSTaskRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-task-role-arn"
+
+  TaskRoleName:
+    Description: Name of the ECS task role.
+    Value: !Ref ECSTaskRole
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-task-role-name"

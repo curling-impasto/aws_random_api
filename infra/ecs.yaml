@@ -1,0 +1,218 @@
+# =============================================================================
+# random-api — ecs.yaml
+#
+# Creates the ECS compute layer for the random-api service:
+#   RandomApiLogGroup        — CW Log Group with 14-day retention (explicit so
+#                              CF controls retention and cleans up on delete)
+#   RandomApiTaskDefinition  — Fargate task (256 CPU / 512 MB), port 8080,
+#                              awslogs driver → /ecs/random-api-${Environment}
+#   RandomApiService         — Fargate service, DesiredCount 1, awsvpc networking,
+#                              registers with the ALB target group from alb.yaml
+#
+# The container image is pre-built and stored in ECR as cx-devops-ecs:random-api.
+# It is NOT built by the pipeline — the ImageUri is passed in as a parameter
+# resolved from the ECR repo at deploy time.
+#
+# All upstream infra (VPC, subnets, ECS cluster, security group, roles, TG)
+# is pre-existing or created by sibling stacks and passed as parameters.
+#
+# Deploy order: iam.yaml ──► alb.yaml ──► ecs.yaml ──► cw.yaml
+# =============================================================================
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Random API — CW Log Group, ECS task definition and Fargate service.
+  Uses a pre-built image from ECR (cx-devops-ecs:random-api).
+
+# -----------------------------------------------------------------------------
+# Parameters
+# -----------------------------------------------------------------------------
+Parameters:
+  ProjectName:
+    Type: String
+    Default: random-api
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, ppe, prod]
+
+  ImageUri:
+    Type: String
+    Description: >
+      Full ECR image URI for the random-api container.
+      The image is pre-built and stored in the shared ECR repo — it is NOT
+      built by the CI pipeline.
+      ECR repo:  cx-devops-ecs
+      Image tag: random-api
+      Example:   123456789012.dkr.ecr.us-east-1.amazonaws.com/cx-devops-ecs:random-api
+
+  ClusterArn:
+    Type: String
+    Description: >
+      ARN or name of the pre-existing ECS cluster where the service will run.
+
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: >
+      Security group attached to the Fargate task ENIs.
+      Must allow inbound TCP 8080 from the ALB security group.
+
+  SubnetIds:
+    Type: CommaDelimitedList
+    Description: >
+      Comma-delimited list of private subnet IDs for the Fargate tasks.
+      Example: subnet-aaa111,subnet-bbb222
+
+  ExecutionRoleArn:
+    Type: String
+    Description: >
+      ARN of the ECS execution role — imported from iam.yaml output.
+      Grants the ECS agent permission to pull images and write log streams.
+
+  TaskRoleArn:
+    Type: String
+    Description: >
+      ARN of the ECS task role — imported from iam.yaml output.
+      Grants the running container permission to write to CloudWatch Logs.
+
+  TargetGroupArn:
+    Type: String
+    Description: >
+      ARN of the ALB target group — imported from alb.yaml output via root.yaml.
+      The service registers its task IPs with this target group.
+
+# -----------------------------------------------------------------------------
+# Resources
+# -----------------------------------------------------------------------------
+Resources:
+  # ── 1. CloudWatch Log Group ────────────────────────────────────────────────
+  # Explicit log group so CF controls retention and deletes it on stack teardown.
+  # If omitted, the awslogs driver creates one automatically with no retention
+  # and it is orphaned when the stack is deleted.
+  RandomApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/ecs/random-api-${Environment}"
+      RetentionInDays: 14
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ── 2. Task Definition ─────────────────────────────────────────────────────
+  # Fargate launch type — no EC2 instances to manage.
+  # DependsOn RandomApiLogGroup ensures the log group exists before the task
+  # definition is registered, so the awslogs driver can write immediately.
+  # Image is pulled from the pre-existing ECR repo cx-devops-ecs:random-api.
+  RandomApiTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: RandomApiLogGroup
+    Properties:
+      Family: !Sub "random-api-${Environment}"
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      ExecutionRoleArn: !Ref ExecutionRoleArn
+      TaskRoleArn: !Ref TaskRoleArn
+
+      ContainerDefinitions:
+        - Name: random-api
+          Image: !Ref ImageUri
+          Essential: true
+
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+
+          # Structured JSON logs → CloudWatch via the awslogs driver.
+          # app.py emits one JSON line per request to stdout; the driver
+          # ships each line to CW as a separate log event.
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub "/ecs/random-api-${Environment}"
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: random-api
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ── 3. ECS Service ─────────────────────────────────────────────────────────
+  # Registers tasks with the ALB target group so the listener rule in alb.yaml
+  # can route /random* traffic to them.
+  #
+  # DependsOn note: the ECS service must not start before the ALB listener rule
+  # exists — otherwise the service health checks fail on startup and ECS
+  # immediately replaces the tasks in a boot-loop. The listener rule lives in
+  # alb.yaml and its stack (ALBStack) is declared before ECSStack in root.yaml,
+  # so CloudFormation guarantees ALBStack is COMPLETE before this resource is
+  # created. No explicit DependsOn is needed here; the ordering is implicit via
+  # the !GetAtt TargetGroupArn reference chain in root.yaml.
+  RandomApiService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "random-api-${Environment}"
+      Cluster: !Ref ClusterArn
+      LaunchType: FARGATE
+      DesiredCount: 1
+      TaskDefinition: !Ref RandomApiTaskDefinition
+
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups:
+            - !Ref SecurityGroupId
+
+      LoadBalancers:
+        - ContainerName: random-api
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TargetGroupArn
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# -----------------------------------------------------------------------------
+# Outputs
+# -----------------------------------------------------------------------------
+Outputs:
+  LogGroupName:
+    Description: Name of the CloudWatch log group.
+    Value: !Ref RandomApiLogGroup
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-log-group-name"
+
+  TaskDefinitionArn:
+    Description: ARN of the ECS task definition.
+    Value: !Ref RandomApiTaskDefinition
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-task-definition-arn"
+
+  ServiceName:
+    Description: Name of the ECS service.
+    Value: !GetAtt RandomApiService.Name
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-service-name"
+
+  ClusterArn:
+    Description: ARN/name of the ECS cluster (passed through for convenience).
+    Value: !Ref ClusterArn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-cluster-arn"

@@ -1,0 +1,114 @@
+# =============================================================================
+# random-api — alb.yaml
+#
+# Creates the ALB routing layer for the random-api service:
+#   RandomTargetGroup   — ip-mode TG on port 8080 (required for Fargate awsvpc)
+#   RandomListenerRule  — path-pattern /random* → forward to RandomTargetGroup
+#
+# NOTE: The listener rule path (/random*) is intentionally kept as-is.
+# Only the project naming (random-api) changes here.
+#
+# All other ALB infrastructure (load balancer, VPC, HTTPS listener) is
+# pre-existing and passed as parameters.
+#
+# Deploy order: iam.yaml ──► alb.yaml ──► ecs.yaml ──► cw.yaml
+# =============================================================================
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Random-API — ALB target group and listener rule for the random-api ECS service.
+
+# -----------------------------------------------------------------------------
+# Parameters
+# -----------------------------------------------------------------------------
+Parameters:
+  ProjectName:
+    Type: String
+    Default: random-api
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, ppe, prod]
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: >
+      ID of the pre-existing VPC where the ALB and ECS tasks run.
+      Used to associate the target group with the correct network.
+
+  ListenerArn:
+    Type: String
+    Description: >
+      ARN of the pre-existing HTTPS ALB listener (port 443).
+      The listener rule created here will be attached to this listener.
+
+# -----------------------------------------------------------------------------
+# Resources
+# -----------------------------------------------------------------------------
+Resources:
+  # ── 1. Target Group ────────────────────────────────────────────────────────
+  # TargetType must be "ip" for Fargate tasks using awsvpc networking.
+  # The ECS service registers task ENI IPs directly — not instance IDs.
+  RandomTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "random-api-${Environment}-tg"
+      Protocol: HTTP
+      Port: 8080
+      TargetType: ip
+      VpcId: !Ref VpcId
+
+      # Health check — the /health path returns 200 silently (no logging,
+      # no business logic). Using a dedicated health endpoint prevents ALB probes
+      # from triggering the 80/20 random logic or polluting CloudWatch Logs.
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ── 2. Listener Rule ───────────────────────────────────────────────────────
+  # Attaches to the pre-existing HTTPS listener.
+  # Requests matching /random* are forwarded to RandomTargetGroup.
+  # The path /random* is intentionally kept — it is the public API contract
+  # and must not change when the project is renamed to random-api.
+  # Priority 100 — adjust if other rules conflict in your listener.
+  RandomListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ListenerArn
+      Priority: 100
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /random*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref RandomTargetGroup
+
+# -----------------------------------------------------------------------------
+# Outputs
+# -----------------------------------------------------------------------------
+Outputs:
+  TargetGroupArn:
+    Description: ARN of the random-api service target group.
+    Value: !Ref RandomTargetGroup
+    Export:
+      Name: !Sub "random-api-${Environment}-target-group-arn"
+
+  ListenerRuleArn:
+    Description: ARN of the ALB listener rule for /random*.
+    Value: !Ref RandomListenerRule
+    Export:
+      Name: !Sub "random-api-${Environment}-listener-rule-arn"
